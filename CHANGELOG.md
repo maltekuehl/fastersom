@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Documentation on Read the Docs (https://fastersom.readthedocs.io): a user guide, two tutorials (clustering mass
+  cytometry like FlowSOM, and pixel clustering of multiplexed images) and the API reference, built with Sphinx in the
+  layout of the scverse cookiecutter template. `pip install fastersom[doc]` installs what the build needs.
+
 ## 0.5.0 (2026-10-24)
 
 - On MPS (Apple GPUs, torch >= 2.6; tested with 2.8 and 2.14), the BMU search runs in fused Metal kernels, which keep
