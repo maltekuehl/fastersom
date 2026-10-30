@@ -41,6 +41,20 @@
   beyond the points. The result, a `SpanningTree`, holds the edges and their distances and gives degrees, leaves, hop
   counts and path lengths, single-linkage clusters (`labels`), a scipy linkage matrix and a scipy sparse matrix, each in
   memory linear in the number of nodes beyond the output.
+- On CUDA, the tensor-core kernel loops over chunks of 16 features instead of 32 on GPUs whose blocks lack the shared
+  memory for the pipeline buffers of chunks of 32, as Triton reports when it launches the kernel. Compiled by Triton 3.8
+  for compute capability 10.0 (B200), chunks of 32 take 240 KB of shared memory, beyond its 227 KB, so that there the
+  kernel should have failed its self-check from 25 features, warned and left the float32 kernel or the torch path; for
+  8.x they take 128-144 KB, beyond the 99 KB of Ada and consumer Ampere GPUs. Chunks of 16 take at most 120 KB.
+  Untested on these GPUs: the sizes come from compiling the kernel for them without a GPU.
+- On CUDA, Ada GPUs (compute capability 8.9: RTX 6000 Ada, L40S, L4, L40, GeForce RTX 40 series) search under
+  euclidean, cosine and correlation on tensor cores from 128 features on, in chunks of 16 features. Measured on an RTX
+  6000 Ada (500,000 samples, 10 epochs): below 128 features the float32 kernel is faster (a fit at 34 features took
+  1.1-1.9x as long on tensor cores), at 128 they are even or faster (0.81-0.98x), and from 196 to 512 features a fit
+  takes 0.56-0.72x as long as with cuBLAS; the BMUs agree with the torch path's up to near-ties (at least 0.99998).
+
+## 0.7.0 (2026-10-29)
+
 - `SOM(init="pca")`: linear initialisation as in the SOM Toolbox, a grid in the plane of the first two principal
   components, centred at the mean, with the longer side of the map along the first component and each side spanning one
   standard deviation of its component; under cosine and correlation of the samples as these metrics compare them.
@@ -50,10 +64,11 @@
   batch's scores and its copies stay within about 16 MB each: glibc maps blocks beyond 32 MB afresh on every
   allocation, and an epoch then takes up to 2-4x as long (twice as long at 10 x 10 nodes x 2000 features). On 200,000
   samples x 16 and 64 features on an AMD EPYC 7742 with 8 threads, an epoch takes about as long up to 22 x 22 nodes and
-  a third to a half as long from 32 x 32 to 100 x 100 nodes (71 x 71 x 16: 1.74 to 0.55 s), but at 200 x 200 nodes x
-  64 features about 40% longer (23.7 to 34 s; pass `batch_size=8192` there). On macOS it is 2^24 / max(n_nodes,
-  n_features), from 8192 to 65536: on 200,000 samples x 34 features on an M3 Max, an epoch takes half as long at
-  10 x 10 nodes (25.5 to 12.9 ms) and a quarter less at 22 x 22.
+  a third to a half as long from 32 x 32 to 100 x 100 nodes (71 x 71 x 16: 1.74 to 0.55 s). Beyond 16,384 nodes or
+  features, where even 512 samples exceed 32 MB, it stays 8192: with 16 threads at 60 features, an epoch at 512
+  samples takes 0.3x as long as at 8192 at 120 x 120 nodes, but 1.1x as long at 140 x 140 and 1.2x at 200 x 200. On
+  macOS it is 2^24 / max(n_nodes, n_features), from 8192 to 65536: on 200,000 samples x 34 features on an M3 Max, an
+  epoch takes half as long at 10 x 10 nodes (25.5 to 12.9 ms) and a quarter less at 22 x 22.
 - The BMU search without a fused kernel (always on the CPU, on GPUs where none applies) computes the nodes' operands
   once per search rather than once per batch: on the CPU, 5 epochs at 100 x 100 nodes x 1000 features take 5.2 s
   rather than 11.4 s.

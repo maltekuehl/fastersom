@@ -62,10 +62,23 @@ _FUSED_MAX_FEATURES = 128
 # Compute capabilities of data-centre GPUs (A100, H100, B200), whose TF32 tensor cores do about 8x the multiply-adds of
 # their float32 cores, so that three TF32 products per float32 product still win; on GeForce, RTX and L40 GPUs they do
 # 1-2x. There the tensor-core kernel searches dot-product scores at any feature count (on an A100, fit 1.5x faster than
-# with the float32 kernel at 34 features from 100 x 100 nodes, 1.4-1.8x at 128, 1.3-1.8x faster than cuBLAS beyond).
-# The capability does not tell variants with cut-down tensor cores such as the H20 (9.0), where it is likely slower;
-# timing both kernels on the device instead could pick differently from run to run, and so change the map
+# with the float32 kernel at 34 features from 100 x 100 nodes, 1.4-1.8x at 128, 1.3-1.8x faster than cuBLAS beyond). The
+# capability does not tell variants with cut-down tensor cores such as the H20 (9.0), where it is likely slower; timing
+# both kernels on the device instead could pick differently from run to run, and so change the map
 _FAST_TF32 = ((8, 0), (9, 0), (10, 0))
+# Compute capabilities whose tensor cores win only from a number of features on: Ada (8.9), whose TF32 tensor cores do
+# 2x (RTX 6000 Ada, L40S, L4) or 1x (L40, GeForce RTX 40) its float32 multiply-adds. On an RTX 6000 Ada (500,000 samples
+# of uniform data, 10 epochs, 30 x 30 and 100 x 100 nodes) a fit took 1.9x and 1.1x as long on tensor cores as with the
+# float32 kernel at 34 features, 1.1x and 0.85x at 64, 0.98x and 0.81x at 128, and 0.56-0.72x as long as with cuBLAS
+# from 196 to 512; the BMUs agreed with the torch path's up to near-ties (at least 0.99998 of the samples)
+_TF32_FROM_FEATURES = {(8, 9): 128}
+
+
+def _tensor_cores(capability: tuple[int, int], n_features: int) -> bool:
+    """Return whether a GPU of this compute capability searches dot-product scores on tensor cores at n_features."""
+    return capability in _FAST_TF32 or n_features >= _TF32_FROM_FEATURES.get(capability, float("inf"))
+
+
 _FAILED: set[tuple[torch.device, str]] = set()  # kernels that failed their self-check on a device
 _PRECISIONS = ("float32", "float16")
 # samples whose BMUs the CPU adds in one index_add_ (see SOM._sums_cpu), and their largest number of values: each
@@ -296,17 +309,17 @@ class SOM:
     """Batch self-organising map on a rectangular grid, by default with a gaussian neighbourhood.
 
     On CUDA with Triton's Gluon (Triton >= 3.5, part of torch's Linux wheels from torch 2.9), the BMU search of fit,
-    predict, quantization_error and topographic_error runs in a fused kernel that never stores the batch x nodes
-    scores: under manhattan always, under the other metrics up to 128 features, beyond which cuBLAS's matrix product is
-    as fast. It computes in float32 like the torch path, so the BMUs differ only on near-ties. On A100, H100 and B200
-    GPUs, the other metrics' search instead runs on tensor cores at any feature count (for maps of over 64 nodes and
-    nodes x features >= 8192), with float32 accuracy from three TF32 products per product (3xTF32); its BMUs too
-    differ only on near-ties, and match float64's more often than float32's. The first use of a feature count compiles
-    the kernel (2-4 s the first time, cached on disk by Triton), which needs a C compiler and the Python headers, and
-    checks it on a tiny search; a kernel that fails warns and leaves the next one (tensor cores, float32 kernel, torch
-    path). On MPS (torch >= 2.6) the search runs in fused Metal kernels, in float32 on the simdgroup matrix units (on
-    the ALUs under manhattan, up to 512 features), compiled at runtime in about 0.2 s per feature count and checked in
-    the same way.
+    predict, quantization_error and topographic_error runs in a fused kernel that never stores the batch x nodes scores:
+    under manhattan always, under the other metrics up to 128 features, beyond which cuBLAS's matrix product is as fast.
+    It computes in float32 like the torch path, so the BMUs differ only on near-ties. On A100, H100 and B200 GPUs, the
+    other metrics' search instead runs on tensor cores at any feature count, and on Ada GPUs (such as the RTX 6000 Ada
+    and L40S) from 128 features on (for maps of over 64 nodes and nodes x features >= 8192), with float32 accuracy from three TF32 products per product
+    (3xTF32); its BMUs too differ only on near-ties, and match float64's more often than float32's. The first use of a
+    feature count compiles the kernel (2-4 s the first time, cached on disk by Triton), which needs a C compiler and the
+    Python headers, and checks it on a tiny search; a kernel that fails warns and leaves the next one (tensor cores,
+    float32 kernel, torch path). On MPS (torch >= 2.6) the search runs in fused Metal kernels, in float32 on the
+    simdgroup matrix units (on the ALUs under manhattan, up to 512 features), compiled at runtime in about 0.2 s per
+    feature count and checked in the same way.
 
     Parameters
     ----------
@@ -358,10 +371,10 @@ class SOM:
         (about batch_size x n_nodes floats, batch_size x n_features with the fused kernel) and speed only. Each
         epoch's update is the same up to float summation order, but over several epochs such rounding differences
         (as between devices) can flip near-tied BMUs, so maps agree in quality rather than bit for bit. Defaults
-        on the CPU to 2^22 / max(n_nodes, n_features), from 512 to 65536 (on macOS 2^24 / max(n_nodes,
-        n_features), from 8192 to 65536), and on GPUs to 2^28 / n_nodes (where speed levels off; 2^26 / n_features
-        with the fused kernel), fewer if that does not fit in memory_fraction of the free GPU memory (on MPS, of the
-        memory torch recommends; 65536 before torch 2.5).
+        on the CPU to 2^22 / max(n_nodes, n_features), from 512 to 65536, and 8192 beyond 16,384 nodes or features
+        (on macOS 2^24 / max(n_nodes, n_features), from 8192 to 65536), and on GPUs to 2^28 / n_nodes (where speed
+        levels off; 2^26 / n_features with the fused kernel), fewer if that does not fit in memory_fraction of the
+        free GPU memory (on MPS, of the memory torch recommends; 65536 before torch 2.5).
     memory_fraction
         Fraction of the free GPU memory the default batch_size may use, in (0, 1]. Defaults to 0.9
         on CUDA and 0.5 on MPS, whose memory the system and other apps share.
@@ -559,7 +572,7 @@ class SOM:
 
         The fused kernel of the BMU search, on CUDA "tensor-core" or "float32", on MPS "metal", or None for the
         torch path; with half (fit under precision="float16") first "metal-float16" for dot-product scores from
-        _HALF_MIN_FEATURES features. The tensor-core kernel searches dot-product scores on the GPUs of _FAST_TF32,
+        _HALF_MIN_FEATURES features. The tensor-core kernel searches dot-product scores where _tensor_cores says so,
         for over 64 nodes (a tile of 128 is half empty otherwise) and n_nodes x n_features >= 8192 (below, the float32
         kernel is as fast or faster on an A100); a kernel that fails its self-check leaves the next one.
         """
@@ -574,8 +587,9 @@ class SOM:
             kernels += ["metal"] if metal.supported(n_features, manhattan) else []
         elif _triton(self._device) is not None:
             if not manhattan and n_nodes > 64 and n_nodes * n_features >= 8192:
-                fast_tf32 = torch.cuda.get_device_capability(self._device) in _FAST_TF32
-                kernels += ["tensor-core"] if fast_tf32 else []
+                kernels += (
+                    ["tensor-core"] if _tensor_cores(torch.cuda.get_device_capability(self._device), n_features) else []
+                )
             kernels += ["float32"] if manhattan or n_features <= _FUSED_MAX_FEATURES else []
         return next((k for k in kernels if _works(self._device, k, n_features, self.metric, top2)), None)
 
@@ -598,7 +612,12 @@ class SOM:
             # a batch's scores, and its copies, in about 16 MB each: glibc maps blocks above 32 MB afresh on every
             # allocation, whose page faults make an epoch take up to 2-4x as long (on an AMD EPYC 7742 with 8 threads,
             # from 5 x 5 to 100 x 100 nodes and 8 to 4000 features); below 512 rows, rereading the weights for each
-            # batch costs more than the cache saves at many nodes and features (200 x 200 x 64)
+            # batch costs more than the cache saves
+            if 512 * largest > 1 << 23:
+                # beyond 16,384 nodes or features even 512 rows exceed 32 MB, so smaller batches only add overhead
+                # per batch (with 16 threads at 60 features, an epoch 10% shorter at 140 x 140 nodes at 8192 rows
+                # than at 512, 18% at 200 x 200)
+                return 8192
             return min(1 << 16, max(512, (1 << 22) // largest))
         else:
             return 1 << 16
